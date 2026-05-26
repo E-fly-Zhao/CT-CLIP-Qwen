@@ -121,9 +121,9 @@ def extract_and_merge(checkpoint_path, output_path, qwen_path):
 if __name__ == "__main__":
     # 🚨 我们直接将路径写死为你刚刚探查成功的真实 FSDP 数据层，防止弄错
     # checkpoint_dir = "/mnt/huali/ct_dataset_10000/output/CTClip_step_33500/pytorch_model_fsdp_0"
-    checkpoint_dir = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_8500/pytorch_model_fsdp_0"
+    checkpoint_dir = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_11500/pytorch_model_fsdp_0"
     # 生成的新权重加个 _full_fixed 后缀以示区别
-    output_file = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_8500_full_fixed.pt"
+    output_file = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_11500_full_fixed.pt"
     
     qwen_path = "/home/huali/model/Qwen3.5-9B"
     
