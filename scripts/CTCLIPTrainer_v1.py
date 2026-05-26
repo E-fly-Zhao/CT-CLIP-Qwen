@@ -3,6 +3,8 @@ from shutil import rmtree
 from datetime import timedelta
 
 from transformer_maskgit.optimizer import get_optimizer
+from transformers import BertTokenizer
+
 from eval import evaluate_internal
 from sklearn.metrics import f1_score, accuracy_score
 
@@ -10,7 +12,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from data import CTReportDataset  # 移除了未使用的 CTReportDatasetinfer
+from data import CTReportDataset
+from data_inference_nii import CTReportDatasetinfer
+
 import numpy as np
 import pandas as pd
 
@@ -27,6 +31,15 @@ import os
 
 # helpers
 def apply_softmax(array):
+    """
+    Applies softmax function to a torch array.
+
+    Args:
+        array (torch.Tensor): Input tensor array.
+
+    Returns:
+        torch.Tensor: Tensor array after applying softmax.
+    """
     softmax = torch.nn.Softmax(dim=0)
     softmax_array = softmax(array)
     return softmax_array
@@ -106,18 +119,19 @@ class CTClipTrainer(nn.Module):
         *,
         num_train_steps,
         batch_size,
-        data_train,          # 在 run_train 中，这里传入的是 filtered_train.csv 的路径
-        data_valid,          # 在 run_train 中，这里传入的是 filtered_valid.csv 的路径
-        reports_file_train,  # 传入 filtered_train_reports.csv
-        reports_file_valid,  # 传入 filtered_valid_reports.csv
-        train_meta_file,     # 传入 filtered_train_metadata.csv
-        valid_meta_file,     # 传入 filtered_valid_metadata.csv
+        data_train = "train",
+        data_valid = "valid",
+        reports_file_train = "data_reports.xslx",
+        reports_file_valid = "data_reports.xslx",
+        train_meta_file = "meta_data.csv",
+        valid_meta_file = "meta_data.csv",
+        labels = "labels.csv",
         tokenizer = None,
         lr = 1.25e-6,
         wd = 0.,
         max_grad_norm = 0.5,
         save_results_every = 1,
-        save_model_every = 1,
+        save_model_every = 1 ,
         results_folder = './ctclip/',
         num_workers = 8,
         accelerate_kwargs: dict = dict()
@@ -127,10 +141,10 @@ class CTClipTrainer(nn.Module):
         kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=36000))
         self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs, kwargs], **accelerate_kwargs)
         self.CTClip = CTClip
-        
         if tokenizer != None:
             self.tokenizer=tokenizer
         else:
+            # self.tokenizer=BertTokenizer.from_pretrained('microsoft/BiomedVLP-CXR-BERT-specialized',do_lower_case=True)
             from transformers import AutoTokenizer
             self.tokenizer = AutoTokenizer.from_pretrained("/home/huali/model/Qwen3.5-9B", trust_remote_code=True)
             if self.tokenizer.pad_token is None:
@@ -142,34 +156,37 @@ class CTClipTrainer(nn.Module):
         self.batch_size = batch_size
 
         all_parameters = set(CTClip.parameters())
-        self.optim = get_optimizer(all_parameters, lr=lr, wd=wd)
-        self.max_grad_norm = max_grad_norm
-        self.lr = lr
 
-        # ===================================================================
-        # 对接重构后的全部位 data.py 数据流
-        # ===================================================================
+        self.optim = get_optimizer(all_parameters, lr=lr, wd=wd)
+
+        self.max_grad_norm = max_grad_norm
+        self.lr=lr
+
+        # self.ds = CTReportDataset(data_folder=data_train, reports_file=reports_file_train, meta_file=train_meta_file)
+
+        # self.valid_ds = CTReportDatasetinfer(data_folder=data_valid, reports_file=reports_file_valid, meta_file=valid_meta_file, labels = labels)
+        # ✅ 新代码：训练集和验证集统一使用最干净的 CTReportDataset，且不再传 meta_file 和 labels
+        #self.ds = CTReportDataset(data_folder=data_train, reports_file=reports_file_train)
+        #self.valid_ds = CTReportDataset(data_folder=data_valid, reports_file=reports_file_valid)
+        # 必须像这样把 meta_file 传给 Dataset：
         self.ds = CTReportDataset(
-            filtered_csv_path = data_train,       # 指向高纯度训练 CSV
-            reports_file = reports_file_train,
-            meta_file = train_meta_file,
-            is_train = True                       # 标记为训练集 (触发物理截断防污染)
+            data_folder=data_train,
+            reports_file=reports_file_train,
+            meta_file=train_meta_file  # <-- 把它加回来！
         )
 
         self.valid_ds = CTReportDataset(
-            filtered_csv_path = data_valid,       # 指向高纯度验证 CSV
-            reports_file = reports_file_valid,
-            meta_file = valid_meta_file,
-            is_train = False                      # 标记为验证集 (触发数据复制防死锁)
+            data_folder=data_valid,
+            reports_file=reports_file_valid,
+            meta_file=valid_meta_file  # <-- 把它加回来！
         )
-        # ===================================================================
 
         self.dl = DataLoader(
             self.ds,
             num_workers=num_workers,
             batch_size=self.batch_size,
             shuffle = True,
-            drop_last = True,
+            drop_last = True,  # 🚨 加上这一行：强制丢弃凑不齐的尾部数据！
         )
 
         self.valid_dl = DataLoader(
@@ -177,7 +194,7 @@ class CTClipTrainer(nn.Module):
             num_workers=num_workers,
             batch_size=1,
             shuffle = False,
-            drop_last = True, 
+            drop_last = True,  # 🚨 验证集也顺手加上
         )
 
         # prepare with accelerator
@@ -187,7 +204,7 @@ class CTClipTrainer(nn.Module):
         self.CTClip.to(self.device)
 
         (
-            self.dl_iter,
+ 			self.dl_iter,
             self.valid_dl_iter,
             self.CTClip,
             self.optim,
@@ -208,11 +225,13 @@ class CTClipTrainer(nn.Module):
 
         self.results_folder.mkdir(parents=True, exist_ok=True)
 
+        # 在 __init__ 的最后添加：
         self.saved_checkpoints = []
 
     def save(self, path):
         if not self.accelerator.is_local_main_process:
             return
+
         pkg = dict(
             model=self.accelerator.get_state_dict(self.CTClip),
             optim=self.optim.state_dict(),
@@ -232,24 +251,32 @@ class CTClipTrainer(nn.Module):
     def print(self, msg):
         self.accelerator.print(msg)
 
+
     @property
     def is_main(self):
         return self.accelerator.is_main_process
 
     def train_step(self):
         device = self.device
+
         steps = int(self.steps.item())
+
         self.CTClip.train()
 
+        # logs
         logs = {}
 
-        # 接收来自新 data.py 的张量和文本
+        # update CTClip model
         video, text = next(self.dl_iter)
 
-        video = video.to(device)
+        device=self.device
+        video=video.to(device)
+        mask = torch.ones((video.shape[0], video.shape[2])).bool().to(device)
+        #text = text.to(device)
         text = list(text)
-        text_tokens = self.tokenizer(text, return_tensors="pt", padding="max_length", truncation=True, max_length=512).to(device)
+        text_tokens=self.tokenizer(text, return_tensors="pt", padding="max_length", truncation=True, max_length=512).to(device)
 
+        #video = video
         with self.accelerator.autocast():
             loss = self.CTClip(text_tokens, video, return_loss=True, device=device)
 
@@ -262,13 +289,112 @@ class CTClipTrainer(nn.Module):
         self.optim.zero_grad()
         self.print(f"{steps}: loss: {logs['loss']}")
 
-        # ===================================================================
-        # 破解 NCCL 死锁的验证逻辑 (原版保留)
-        # ===================================================================
+        # if self.is_main and not (steps % self.save_results_every):
+        #     with torch.no_grad():
+
+        #         models_to_evaluate = ((self.CTClip, str(steps)),)
+
+        #         for model, filename in models_to_evaluate:
+        #             model.eval()
+        #             predictedall=[]
+        #             realall=[]
+
+        #             #Fast inference on 100 images
+        #             for i in range(10):
+        #                 print("test")
+        #                 valid_data, text, onehotlabels, name_acc = next(self.valid_dl_iter)
+        #                 valid_data = valid_data.to(device)
+
+        #                 if "module" in model.__dict__:
+        #                     model = model.module
+
+        #                 pathologies = ['Medical material','Arterial wall calcification', 'Cardiomegaly', 'Pericardial effusion','Coronary artery wall calcification', 'Hiatal hernia','Lymphadenopathy', 'Emphysema', 'Atelectasis', 'Lung nodule','Lung opacity', 'Pulmonary fibrotic sequela', 'Pleural effusion', 'Mosaic attenuation pattern','Peribronchial thickening', 'Consolidation', 'Bronchiectasis','Interlobular septal thickening']
+        #                 plotdir = str(self.results_folder / f'CTClip_{steps}' )
+        #                 plotdir = plotdir + "/"
+
+        #                 Path(plotdir).mkdir(parents=True, exist_ok=True)
+
+        #                 predictedlabels=[]
+        #                 for pathology in pathologies:
+        #                     text = [f"There is {pathology}.", f"There is no {pathology}."]
+        #                     text_tokens=self.tokenizer(
+        #                                     text, return_tensors="pt", padding="max_length", truncation=True, max_length=512).to(device)
+        #                     output = model(text_tokens, valid_data,  device=device)
+
+
+        #                     output = apply_softmax(output)
+
+        #                     append_out=output.detach().cpu().numpy()
+
+        #                     if output[0]>output[1]:
+        #                         predictedlabels.append(append_out[0])
+        #                     else:
+        #                         predictedlabels.append(append_out[0])
+        #                 predictedall.append(predictedlabels)
+        #                 realall.append(onehotlabels.detach().cpu().numpy()[0])
+        #                 # Print and save classification report
+        #             realall=np.array(realall)
+        #             predictedall=np.array(predictedall)
+
+        #             dfs=evaluate_internal(predictedall,realall,pathologies, plotdir)
+        #             realall = np.rint(realall).astype(int)
+        #             predictedall = np.rint(predictedall).astype(int)
+
+
+        #             print('Test F1 Accuracy: ', f1_score(realall, predictedall,average='micro'))
+        #             print('Test Flat Accuracy: ', accuracy_score(realall.flatten(), predictedall.flatten()),'\n')
+
+        #             writer = pd.ExcelWriter(f'{plotdir}aurocs.xlsx', engine='xlsxwriter')
+
+        #             dfs.to_excel(writer, sheet_name='Sheet1', index=False)
+
+        #             writer.close()
+        #             del output
+        # if self.is_main and not (steps % self.save_results_every):
+        #     self.print(f"🔄 Running Validation at step {steps}...")
+            
+        #     # 切换为 eval 模式
+        #     self.CTClip.eval()
+            
+        #     with torch.no_grad():
+        #         total_val_loss = 0.0
+        #         #val_steps = 10 # 从验证集中抽取 10 个 Batch 计算平均 Loss
+        #         val_steps = 2
+                
+        #         for _ in range(val_steps):
+        #             try:
+        #                 val_video, val_text = next(self.valid_dl_iter)
+        #             except StopIteration:
+        #                 # 如果迭代器到底了，重新循环
+        #                 self.valid_dl_iter = cycle(self.valid_dl)
+        #                 val_video, val_text = next(self.valid_dl_iter)
+
+        #             val_video = val_video.to(device)
+        #             val_text = list(val_text)
+        #             val_text_tokens = self.tokenizer(
+        #                 val_text, return_tensors="pt", padding="max_length", truncation=True, max_length=512
+        #             ).to(device)
+
+        #             # 仅计算 Loss，不收集任何分类概率
+        #             with self.accelerator.autocast():
+        #                 val_loss = self.CTClip(val_text_tokens, val_video, return_loss=True, device=device)
+                    
+        #             total_val_loss += val_loss.item()
+
+        #         avg_val_loss = total_val_loss / val_steps
+        #         self.print(f"✅ Step {steps} Validation Contrastive Loss: {avg_val_loss:.4f}\n")
+                
+        #     # 恢复训练模式
+        #     self.CTClip.train()
+        # 替换：破解 NCCL 死锁的验证逻辑 
+        # 绝对不能用 self.is_main 拦截！必须所有卡同时进入！
         if not (steps % self.save_results_every):
+            
+            # 只有主卡负责打印
             if self.is_main:
                 self.print(f"🔄 Running Validation at step {steps}...")
             
+            # 切换为 eval 模式
             self.CTClip.eval()
             
             with torch.no_grad():
@@ -279,6 +405,7 @@ class CTClipTrainer(nn.Module):
                     try:
                         val_video, val_text = next(self.valid_dl_iter)
                     except StopIteration:
+                        # 如果迭代器到底了，重新循环
                         self.valid_dl_iter = cycle(self.valid_dl)
                         val_video, val_text = next(self.valid_dl_iter)
 
@@ -288,6 +415,7 @@ class CTClipTrainer(nn.Module):
                         val_text, return_tensors="pt", padding="max_length", truncation=True, max_length=512
                     ).to(device)
 
+                    # 🚨 核心：所有 16 张卡都必须执行这一句 all_gather 操作！
                     with self.accelerator.autocast():
                         val_loss = self.CTClip(val_text_tokens, val_video, return_loss=True, device=device)
                     
@@ -295,20 +423,38 @@ class CTClipTrainer(nn.Module):
 
                 avg_val_loss = total_val_loss / val_steps
                 
+                # 只有主卡负责打印 Loss
                 if self.is_main:
                     self.print(f"✅ Step {steps} Validation Contrastive Loss: {avg_val_loss:.4f}\n")
                 
+            # 恢复训练模式
             self.CTClip.train()
+        # 替换结束
 
-        # ===================================================================
-        # 绝对安全的 FSDP 切片保存逻辑 (原版保留)
-        # ===================================================================
+
+        # save model every so often
+
+        # if self.is_main and not (steps % self.save_model_every):
+        #     model_path = str(self.results_folder / f'CTClip.{steps}.pt')
+        #     state_dict=self.accelerator.get_state_dict(self.CTClip, unwrap=False)
+
+        #     self.accelerator.save(state_dict, model_path)
+
+        #     self.print(f'{steps}: saving model to {str(self.results_folder)}')
+
+        # 🚨 确保到了保存步数，所有卡都进入这个代码块
         if steps > 0 and not (steps % self.save_model_every):
+            
+            # 强行集合，确保所有卡都跑完了第 50 步
             self.accelerator.wait_for_everyone()
             
+            # 定义一个文件夹路径（注意：分片保存必须存成文件夹，不能存成单一的 .pt 文件）
             save_dir = str(self.results_folder / f'CTClip_step_{steps}')
+            
+            # 🚀 终极杀招：直接让 8 张卡各自向硬盘写入自己的切片！绝对不要拼装！
             self.accelerator.save_state(save_dir)
             
+            # 只有主卡负责打印日志和清理旧文件
             if self.is_main:
                 self.print(f'{steps}: successfully saved sharded model to {save_dir}')
                 
@@ -317,19 +463,23 @@ class CTClipTrainer(nn.Module):
                 
                 self.saved_checkpoints.append(save_dir)
                 
+                # 保留最近 10 个 Checkpoint 文件夹，防止硬盘爆满
                 if len(self.saved_checkpoints) > 10:
                     oldest_ckpt = self.saved_checkpoints.pop(0)
                     if os.path.exists(oldest_ckpt):
                         import shutil
                         try:
+                            # 注意：由于保存的是文件夹，必须用 shutil.rmtree 删除
                             shutil.rmtree(oldest_ckpt)
                         except Exception as e:
                             print(f"Failed to remove {oldest_ckpt}: {e}")
                             
+            # 再次集合，防止主卡删文件太慢导致进度脱节
             self.accelerator.wait_for_everyone()
 
         self.steps += 1
         return logs
+
 
     def train(self, log_fn=noop):
         while self.steps < self.num_train_steps:
@@ -338,8 +488,10 @@ class CTClipTrainer(nn.Module):
 
         self.print('training complete')
 
-        # 【修复 BUG】：此处原代码为 self.model，导致最后一步无法保存。现已改为 self.CTClip
+        # 【新增逻辑】：在训练完全结束时，强制保存最终版本
         if self.is_main:
-            final_model_path = str(self.results_folder / f'CTClip_final_step_{int(self.steps.item())}.pt')
-            self.accelerator.save(self.accelerator.get_state_dict(self.CTClip), final_model_path)
+            final_model_path = str(self.results_folder / f'CTClip_final_step_{self.steps}.pt')
+            self.accelerator.save(self.accelerator.get_state_dict(self.model), final_model_path)
             self.print(f"✅ Final model saved to {final_model_path}")
+
+

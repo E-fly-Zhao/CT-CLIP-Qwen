@@ -21,6 +21,8 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 
+import numpy as np
+
 # ==========================================================
 # 跨卡对比学习核心组件：可导的 All-Gather 层
 # ==========================================================
@@ -601,7 +603,9 @@ class CTCLIP(nn.Module):
 
         #self.temperature = nn.Parameter(torch.tensor(1.))
         # temperature (已适配 FSDP 要求)
-        self.temperature = nn.Parameter(torch.ones(1))
+        #self.temperature = nn.Parameter(torch.ones(1))
+        # 初始化为 ln(14.28) 约等于 2.659
+        self.temperature = nn.Parameter(torch.ones(1) * np.log(1 / 0.07))
 
         # from https://arxiv.org/abs/2111.07783 (FILIP paper)
         self.use_all_token_embeds = use_all_token_embeds

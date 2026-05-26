@@ -162,7 +162,7 @@ class CTLabelMatrixDataset(Dataset):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     #results_folder = "./qwen_zeroshot_results/"
-    results_folder = "./qwen_zeroshot_2000/"
+    results_folder = "./qwen_zeroshot_2000_fix/"
     os.makedirs(results_folder, exist_ok=True)
 
     # 路径配置
@@ -171,7 +171,8 @@ def main():
     csv_file = "/home/huali/workspace/psj/evaluation_dataset/api/eval/labeled_eval_label_matrix.csv"
     data_dir = "/oss/share_data/CT/ct_dataset_eval_260514/ct_dataset_eval_260514_img/"
     qwen_path = "/home/huali/model/Qwen3.5-9B"
-    pretrained_weights = "/mnt/huali/ct_dataset_10000/output/CTClip_step_34500_full.pt"
+    #pretrained_weights = "/mnt/huali/ct_dataset_10000/output/CTClip_step_34500_full.pt"
+    pretrained_weights = "/mnt/huali/ct_dataset_10000/output/CTClip_step_33500_full_fixed.pt"
     # 注意：如果你的 CTLabelMatrixDataset 修改了参数要求，请务必传入 meta_file 和 reports_full_file
     #meta_file = "/home/huali/code/CT-CLIP-main/CT_CLIP/dataset_10000/valid_metadata.csv" # 请确保路径正确
     meta_file = "/oss/share_data/CT/ct_dataset_eval_260514/train_metadata.csv"
