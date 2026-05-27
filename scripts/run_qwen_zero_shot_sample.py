@@ -11,6 +11,7 @@ from ct_clip import CTCLIP
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 import nibabel as nib
 import torch.nn.functional as F
+from itertools import cycle
 
 # 👇 🚨 物理封印 cuDNN，彻底解决 3D Conv 的 bfloat16 崩溃 Bug！
 torch.backends.cudnn.enabled = False
@@ -57,7 +58,7 @@ class CTLabelMatrixDataset(Dataset):
             
         self.data_dir = data_dir
         
-        # 🚨 修正 1：消除 Pandas 混合类型加载警告
+        # 消除 Pandas 混合类型加载警告
         self.meta_df = pd.read_csv(meta_file, low_memory=False)
         
         print(f"✅ 多级数据拓扑对齐大获全胜！测评数据: {len(self.df)} 例。")
@@ -68,7 +69,7 @@ class CTLabelMatrixDataset(Dataset):
     def preprocess_image(self, file_path):
         """完全复刻预训练的黄金预处理管线"""
         nii_img = nib.load(file_path)
-        # 🚨 修正 2：CPU 内存防爆机制！强制使用 float32 读取 NIfTI 数据
+        # CPU 内存防爆机制！强制使用 float32 读取 NIfTI 数据
         img_data = nii_img.get_fdata(dtype=np.float32)
 
         file_name = os.path.basename(file_path)
@@ -106,7 +107,7 @@ class CTLabelMatrixDataset(Dataset):
 
         tensor = torch.tensor(img_data)
         
-        # 🚨 修正 3：动态视野升维！将裁剪中心 Z 轴目标设为 320
+        # 动态视野升维！将裁剪中心 Z 轴目标设为严格的 320
         target_shape = (480, 480, 320)
         h, w, d = tensor.shape
         dh, dw, dd = target_shape
@@ -144,17 +145,17 @@ class CTLabelMatrixDataset(Dataset):
                 raise FileNotFoundError
         except Exception as e:
             print(f"⚠️ 警告: 读取 {folder_name} 失败 ({e})")
-            # 🚨 修正 4：异常托底 Tensor 必须同步为 320 深度！
+            # 异常托底 Tensor 必须同步为 320 深度！
             img_tensor = torch.zeros((1, 320, 480, 480), dtype=torch.bfloat16) 
             
         return img_tensor, labels, folder_name
 
 # ==========================================
-# 2. 核心评估管线 (全矩阵高通量优化版)
+# 2. 核心评估管线 (多维融合高通量优化版)
 # ==========================================
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    results_folder = "./qwen_zeroshot_2000_v2/"
+    results_folder = "./qwen_zeroshot_2000_sample/"
     os.makedirs(results_folder, exist_ok=True)
 
     csv_file = "/home/huali/workspace/psj/evaluation_dataset/api/eval/labeled_eval_label_matrix.csv"
@@ -162,13 +163,13 @@ def main():
     qwen_path = "/home/huali/model/Qwen3.5-9B"
     meta_file = "/oss/share_data/CT/ct_dataset_eval_260514/train_metadata.csv"
 
-    # 🚨 修正 5：挂载我们的权重
-    pretrained_weights = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_11500_full_fixed.pt"
+    # 直接挂载我们生成的满血纯净版权重
+    pretrained_weights = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_8500_full_fixed.pt"
 
     dataset = CTLabelMatrixDataset(csv_file=csv_file, data_dir=data_dir, meta_file=meta_file, limit=None)
     pathologies = dataset.pathologies
     
-    # 你可以安全地将 batch_size 调至 2 或 4 以加快推理速度
+    # 支持任意 batch_size，建议根据显存设为 2, 4 或 8
     dataloader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=4)
     print(f"📊 成功加载数据集，共 {len(dataset)} 例影像，包含 {len(pathologies)} 种疾病标签。")
 
@@ -189,7 +190,6 @@ def main():
 
     print(f"📥 正在加载预训练满血权重: {pretrained_weights}")
     state_dict = torch.load(pretrained_weights, map_location="cpu")
-    # 虽然是满血权重，保留 strict=False 依然是个好习惯
     clip.load_state_dict(state_dict, strict=False)
     clip.to(device)
 
@@ -274,47 +274,37 @@ def main():
 
             logits = (image_latent @ stacked_text_latents.T) / temperature
 
-            # 🚨 修正 6：消除原本 squeeze(0) 带来的 Batch 崩溃隐患
-            # 使其支持任意大小的 inference batch size
+            # 消除原本 squeeze(0) 带来的 Batch 崩溃隐患
             logits = logits.view(batch_size, len(pathologies), 2)
             probs = F.softmax(logits, dim=-1)
 
-            # 提取正样本 (index 0) 概率，支持 Batch 级追加
+            # 提取正样本概率，安全追加到总列表
             patient_preds = probs[:, :, 0].cpu().to(torch.float32).numpy()
             all_predictions.extend(patient_preds.tolist())
             all_labels.extend(labels.numpy().tolist())
 
-            # 保存患者 / 病例 ID，后面按“每个患者一行”计算样本级指标
-            if isinstance(patient_id, (list, tuple)):
-                all_patient_ids.extend([str(x) for x in patient_id])
-            else:
-                all_patient_ids.append(str(patient_id))
-
-    print("📈 正在计算各项评估指标：按疾病 Macro + 按患者 Sample-Level... ")
+    # ==========================================
+    # 双重维度评估核心逻辑 (Macro + Sample)
+    # ==========================================
+    print("📈 正在计算多维度双向评估指标...")
 
     if len(all_predictions) == 0:
         print("❌ 推理未产生任何结果，结束评估。")
         return
 
-    all_predictions = np.array(all_predictions, dtype=np.float32)
-    all_labels = np.array(all_labels, dtype=np.int32)
-    all_binary_preds = (all_predictions >= 0.5).astype(np.int32)
+    all_predictions = np.array(all_predictions)
+    all_labels = np.array(all_labels)
 
-    # 保存原始预测，方便后续重新调阈值或复查
-    np.savez(
-        os.path.join(results_folder, "predictions_and_labels.npz"),
-        preds=all_predictions,
-        binary_preds=all_binary_preds,
-        labels=all_labels,
-        patient_ids=np.array(all_patient_ids),
-        pathologies=np.array(pathologies),
-    )
+    # 概率二值化 (0.5 阈值)
+    all_binary_preds = (all_predictions >= 0.5).astype(int)
 
-    # ==========================================================
-    # A. 按疾病计算：原来的 macro，是“每一类疾病一个 F1，再平均”
-    # ==========================================================
-    disease_results_list = []
-    valid_disease_metrics = {'AUROC': [], 'F1': [], 'Accuracy': [], 'Precision': [], 'Recall': []}
+    np.savez(os.path.join(results_folder, "predictions_and_labels_8500.npz"),
+             preds=all_predictions, labels=all_labels, pathologies=pathologies)
+
+    results_list = []
+    
+    # 1. 计算宏平均 (Macro-Avg: 按病种)
+    valid_metrics = {'AUROC': [], 'F1': [], 'Accuracy': [], 'Precision': [], 'Recall': []}
 
     for i, pathology in enumerate(pathologies):
         y_true = all_labels[:, i]
@@ -331,120 +321,66 @@ def main():
             rec = recall_score(y_true, y_pred, zero_division=0)
 
             metrics.update({"AUROC": auc, "F1": f1, "Accuracy": acc, "Precision": pre, "Recall": rec})
-            valid_disease_metrics['AUROC'].append(auc)
-            valid_disease_metrics['F1'].append(f1)
-            valid_disease_metrics['Accuracy'].append(acc)
-            valid_disease_metrics['Precision'].append(pre)
-            valid_disease_metrics['Recall'].append(rec)
+            valid_metrics['AUROC'].append(auc)
+            valid_metrics['F1'].append(f1)
+            valid_metrics['Accuracy'].append(acc)
+            valid_metrics['Precision'].append(pre)
+            valid_metrics['Recall'].append(rec)
         else:
             metrics.update({"AUROC": "N/A", "F1": "N/A", "Accuracy": "N/A", "Precision": "N/A", "Recall": "N/A"})
 
-        disease_results_list.append(metrics)
+        results_list.append(metrics)
 
-    disease_avg_metrics = {"Pathology": "Disease Macro Average (Valid Only)"}
-    for key in valid_disease_metrics:
-        disease_avg_metrics[key] = np.mean(valid_disease_metrics[key]) if len(valid_disease_metrics[key]) > 0 else "N/A"
-    disease_results_list.append(disease_avg_metrics)
+    avg_metrics = {"Pathology": "=== Macro-Average (Per-Disease) ==="}
+    for key in valid_metrics:
+        avg_metrics[key] = np.mean(valid_metrics[key]) if len(valid_metrics[key]) > 0 else "N/A"
+    results_list.append(avg_metrics)
 
-    df_disease_results = pd.DataFrame(disease_results_list)
-    df_disease_results.to_excel(
-        os.path.join(results_folder, "qwen_zeroshot_disease_macro_metrics.xlsx"),
-        index=False,
-    )
+    # 2. 🚨 计算样本级平均 (Sample-Avg: 按患者) 🚨
+    sample_f1 = f1_score(all_labels, all_binary_preds, average='samples', zero_division=0)
+    sample_precision = precision_score(all_labels, all_binary_preds, average='samples', zero_division=0)
+    sample_recall = recall_score(all_labels, all_binary_preds, average='samples', zero_division=0)
+    
+    # Subset Accuracy (完全匹配率)：患者的所有疾病预测必须和真实情况 100% 完全一致
+    subset_acc = accuracy_score(all_labels, all_binary_preds)
 
-    # ==========================================================
-    # B. 按患者/样本计算：每个患者一行，跨所有疾病标签计算 F1
-    #    最终 Sample-Level F1 = 所有患者 F1 的平均值
-    # ==========================================================
-    patient_results_list = []
-    patient_f1_list = []
-    patient_precision_list = []
-    patient_recall_list = []
-    patient_accuracy_list = []
-
-    for idx in range(all_labels.shape[0]):
-        y_true = all_labels[idx, :]
-        y_pred = all_binary_preds[idx, :]
-
-        sample_f1 = f1_score(y_true, y_pred, zero_division=0)
-        sample_pre = precision_score(y_true, y_pred, zero_division=0)
-        sample_rec = recall_score(y_true, y_pred, zero_division=0)
-        sample_acc = accuracy_score(y_true, y_pred)
-
-        patient_f1_list.append(sample_f1)
-        patient_precision_list.append(sample_pre)
-        patient_recall_list.append(sample_rec)
-        patient_accuracy_list.append(sample_acc)
-
-        patient_results_list.append({
-            "PatientID": all_patient_ids[idx] if idx < len(all_patient_ids) else idx,
-            "Sample_F1": sample_f1,
-            "Sample_Precision": sample_pre,
-            "Sample_Recall": sample_rec,
-            "Sample_Accuracy": sample_acc,
-            "GT_Positive_Count": int(y_true.sum()),
-            "Pred_Positive_Count": int(y_pred.sum()),
-        })
-
-    sample_avg_metrics = {
-        "PatientID": "Sample-Level Average",
-        "Sample_F1": float(np.mean(patient_f1_list)) if len(patient_f1_list) > 0 else "N/A",
-        "Sample_Precision": float(np.mean(patient_precision_list)) if len(patient_precision_list) > 0 else "N/A",
-        "Sample_Recall": float(np.mean(patient_recall_list)) if len(patient_recall_list) > 0 else "N/A",
-        "Sample_Accuracy": float(np.mean(patient_accuracy_list)) if len(patient_accuracy_list) > 0 else "N/A",
-        "GT_Positive_Count": "-",
-        "Pred_Positive_Count": "-",
+    sample_metrics = {
+        "Pathology": "=== Sample-Average (Per-Patient) ===",
+        "AUROC": "N/A", # 样本级 AUC 计算逻辑不稳定，置空
+        "F1": sample_f1,
+        "Accuracy": subset_acc, 
+        "Precision": sample_precision,
+        "Recall": sample_recall
     }
-    patient_results_list.append(sample_avg_metrics)
+    results_list.append(sample_metrics)
 
-    df_patient_results = pd.DataFrame(patient_results_list)
-    df_patient_results.to_excel(
-        os.path.join(results_folder, "qwen_zeroshot_sample_level_metrics.xlsx"),
-        index=False,
-    )
+    # 保存最终大表
+    df_results = pd.DataFrame(results_list)
+    df_results.to_excel(os.path.join(results_folder, "qwen_zeroshot_full_metrics_8500.xlsx"), index=False)
 
-    # 汇总表：把你最关心的 sample-level F1 放在这里
-    summary_metrics = {
-        "Disease_Macro_AUROC": disease_avg_metrics["AUROC"],
-        "Disease_Macro_F1": disease_avg_metrics["F1"],
-        "Disease_Macro_Accuracy": disease_avg_metrics["Accuracy"],
-        "Disease_Macro_Precision": disease_avg_metrics["Precision"],
-        "Disease_Macro_Recall": disease_avg_metrics["Recall"],
-        "Sample_Level_F1": sample_avg_metrics["Sample_F1"],
-        "Sample_Level_Accuracy": sample_avg_metrics["Sample_Accuracy"],
-        "Sample_Level_Precision": sample_avg_metrics["Sample_Precision"],
-        "Sample_Level_Recall": sample_avg_metrics["Sample_Recall"],
-        "Num_Samples": int(all_labels.shape[0]),
-        "Num_Pathologies": int(len(pathologies)),
-        "Threshold": 0.5,
-    }
-    pd.DataFrame([summary_metrics]).to_excel(
-        os.path.join(results_folder, "qwen_zeroshot_summary_metrics.xlsx"),
-        index=False,
-    )
-
-    print("\n" + "="*60)
-    print("🏆 零样本高通量测评最终战报")
-    print("="*60)
-    def format_metric(val): return f"{val:.4f}" if isinstance(val, (float, np.floating)) else "N/A"
-
-    print("📌 按疾病 Macro-Avg：每类疾病先算一次，再对疾病取平均")
-    print(f"   🎯 Disease Macro AUROC:     {format_metric(disease_avg_metrics['AUROC'])}")
-    print(f"   🎯 Disease Macro F1-Score:  {format_metric(disease_avg_metrics['F1'])}")
-    print(f"   🎯 Disease Macro Accuracy:  {format_metric(disease_avg_metrics['Accuracy'])}")
-    print(f"   🎯 Disease Macro Precision: {format_metric(disease_avg_metrics['Precision'])}")
-    print(f"   🎯 Disease Macro Recall:    {format_metric(disease_avg_metrics['Recall'])}")
-
-    print("\n📌 按患者 Sample-Level Avg：每个患者跨所有疾病标签算 F1，再对患者取平均")
-    print(f"   🎯 Sample-Level F1-Score:   {format_metric(sample_avg_metrics['Sample_F1'])}")
-    print(f"   🎯 Sample-Level Accuracy:   {format_metric(sample_avg_metrics['Sample_Accuracy'])}")
-    print(f"   🎯 Sample-Level Precision:  {format_metric(sample_avg_metrics['Sample_Precision'])}")
-    print(f"   🎯 Sample-Level Recall:     {format_metric(sample_avg_metrics['Sample_Recall'])}")
-    print("="*60)
-    print("✅ 评估全部完成！")
-    print(f"📄 疾病级指标: {os.path.join(results_folder, 'qwen_zeroshot_disease_macro_metrics.xlsx')}")
-    print(f"📄 样本级指标: {os.path.join(results_folder, 'qwen_zeroshot_sample_level_metrics.xlsx')}")
-    print(f"📄 汇总指标:   {os.path.join(results_folder, 'qwen_zeroshot_summary_metrics.xlsx')}")
+    # 打印最终战报
+    def format_metric(val): return f"{val:.4f}" if isinstance(val, float) else "N/A"
+    
+    print("\n" + "="*55)
+    print(" 🏥 临床病种级能力 (宏平均 Macro-Avg) ")
+    print("    - 衡量模型知识面的广度与罕见病捕捉能力")
+    print("="*55)
+    print(f"   🎯 AUROC:     {format_metric(avg_metrics['AUROC'])}")
+    print(f"   🎯 F1-Score:  {format_metric(avg_metrics['F1'])}")
+    print(f"   🎯 Accuracy:  {format_metric(avg_metrics['Accuracy'])}")
+    print(f"   🎯 Precision: {format_metric(avg_metrics['Precision'])}")
+    print(f"   🎯 Recall:    {format_metric(avg_metrics['Recall'])}")
+    
+    print("\n" + "="*55)
+    print(" 🧑‍⚕️ 真实患者级能力 (样本级平均 Sample-Avg) ")
+    print("    - 衡量模型对单个患者整体病情描绘的精准度")
+    print("="*55)
+    print(f"   🎯 Sample F1-Score:  {sample_f1:.4f}")
+    print(f"   🎯 Sample Precision: {sample_precision:.4f}")
+    print(f"   🎯 Sample Recall:    {sample_recall:.4f}")
+    print(f"   🎯 Exact Match Rate: {subset_acc:.4f} (全对率)")
+    print("="*55)
+    print("✅ 全维度评估完成！双轨战报已写入 Excel 尾部。")
 
 if __name__ == "__main__":
     main()

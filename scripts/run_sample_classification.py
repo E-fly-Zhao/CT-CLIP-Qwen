@@ -16,14 +16,19 @@ import torch.nn.functional as F
 torch.backends.cudnn.enabled = False
 # 👆 ========================================================
 
-def resize_array(array, current_spacing, target_spacing):
-    original_shape = array.shape[2:]
-    scaling_factors = [
-        current_spacing[i] / target_spacing[i] for i in range(len(original_shape))
-    ]
-    new_shape = [
-        max(1, int(original_shape[i] * scaling_factors[i])) for i in range(len(original_shape))
-    ]
+def resize_array_global(array, current_xy_spacing, target_xy_spacing, target_z_dim):
+    """
+    🚨 强制同步：使用与训练集完全一致的全局重采样引擎
+    array shape: (1, 1, X, Y, Z) 或 (1, 1, Z, X, Y)
+    """
+    original_shape = array.shape[2:] 
+    orig_z, orig_x, orig_y = original_shape
+
+    new_x = max(1, int(orig_x * (current_xy_spacing / target_xy_spacing)))
+    new_y = max(1, int(orig_y * (current_xy_spacing / target_xy_spacing)))
+
+    # 核心：Z轴强制拉伸到 320
+    new_shape = [target_z_dim, new_x, new_y]
     resized_array = F.interpolate(array, size=new_shape, mode='trilinear', align_corners=False).cpu().numpy()
     return resized_array
 
@@ -56,8 +61,6 @@ class CTLabelMatrixDataset(Dataset):
             self.df = self.df.head(limit)
             
         self.data_dir = data_dir
-        
-        # 🚨 修正 1：消除 Pandas 混合类型加载警告
         self.meta_df = pd.read_csv(meta_file, low_memory=False)
         
         print(f"✅ 多级数据拓扑对齐大获全胜！测评数据: {len(self.df)} 例。")
@@ -66,9 +69,8 @@ class CTLabelMatrixDataset(Dataset):
         return len(self.df)
 
     def preprocess_image(self, file_path):
-        """完全复刻预训练的黄金预处理管线"""
+        """🚨 100% 像素级复刻训练的预处理管线"""
         nii_img = nib.load(file_path)
-        # 🚨 修正 2：CPU 内存防爆机制！强制使用 float32 读取 NIfTI 数据
         img_data = nii_img.get_fdata(dtype=np.float32)
 
         file_name = os.path.basename(file_path)
@@ -80,13 +82,17 @@ class CTLabelMatrixDataset(Dataset):
             
         if row.empty:
             slope, intercept = 1.0, -1024.0
-            xy_spacing, z_spacing = 0.75, 1.5 
+            xy_spacing = 0.75
         else:
             slope = float(row["RescaleSlope"].iloc[0])
             intercept = float(row["RescaleIntercept"].iloc[0])
             xy_spacing_str = str(row["XYSpacing"].iloc[0])
             xy_spacing = float(xy_spacing_str[1:][:-2].split(",")[0]) if "[" in xy_spacing_str else float(xy_spacing_str.split(",")[0])
-            z_spacing = float(row["ZSpacing"].iloc[0])
+
+        # 全部位模型参数配置 (必须与 data.py 严格一致)
+        TARGET_D = 320
+        TARGET_XY_SPACING = 0.75
+        TARGET_H, TARGET_W = 480, 480
 
         img_data = slope * img_data + intercept
 
@@ -96,34 +102,32 @@ class CTLabelMatrixDataset(Dataset):
         img_data = img_data.transpose(2, 0, 1)
         tensor = torch.tensor(img_data.copy()).unsqueeze(0).unsqueeze(0)
 
-        current = (z_spacing, xy_spacing, xy_spacing)
-        target = (1.5, 0.75, 0.75)
-        img_data = resize_array(tensor, current, target)[0][0]
+        # 🚨 核心：使用与训练集完全一样的全局压扁/拉伸！
+        img_data = resize_array_global(tensor, xy_spacing, TARGET_XY_SPACING, TARGET_D)[0][0]
         img_data = np.transpose(img_data, (1, 2, 0))
 
         img_data = np.clip(img_data, -1000, 1000)
         img_data = (img_data / 1000).astype(np.float32)
 
         tensor = torch.tensor(img_data)
-        
-        # 🚨 修正 3：动态视野升维！将裁剪中心 Z 轴目标设为 320
-        target_shape = (480, 480, 320)
-        h, w, d = tensor.shape
-        dh, dw, dd = target_shape
-        h_start, h_end = max((h - dh) // 2, 0), min(max((h - dh) // 2, 0) + dh, h)
-        w_start, w_end = max((w - dw) // 2, 0), min(max((w - dw) // 2, 0) + dw, w)
-        d_start, d_end = max((d - dd) // 2, 0), min(max((d - dd) // 2, 0) + dd, d)
+        h, w, d = tensor.shape 
 
-        tensor = tensor[h_start:h_end, w_start:w_end, d_start:d_end]
+        # 🚨 废弃 Z 轴裁剪，仅裁剪 X 和 Y 轴！与训练代码完全一致！
+        h_start = max((h - TARGET_H) // 2, 0)
+        h_end = min(h_start + TARGET_H, h)
+        w_start = max((w - TARGET_W) // 2, 0)
+        w_end = min(w_start + TARGET_W, w)
 
-        pad_h_before = (dh - tensor.size(0)) // 2
-        pad_h_after = dh - tensor.size(0) - pad_h_before
-        pad_w_before = (dw - tensor.size(1)) // 2
-        pad_w_after = dw - tensor.size(1) - pad_w_before
-        pad_d_before = (dd - tensor.size(2)) // 2
-        pad_d_after = dd - tensor.size(2) - pad_d_before
+        tensor = tensor[h_start:h_end, w_start:w_end, :] # Z 轴保留 100% 视野！
 
-        tensor = torch.nn.functional.pad(tensor, (pad_d_before, pad_d_after, pad_w_before, pad_w_after, pad_h_before, pad_h_after), value=-1)
+        pad_h_before = (TARGET_H - tensor.size(0)) // 2
+        pad_h_after = TARGET_H - tensor.size(0) - pad_h_before
+        pad_w_before = (TARGET_W - tensor.size(1)) // 2
+        pad_w_after = TARGET_W - tensor.size(1) - pad_w_before
+
+        # PyTorch 的 pad 是从最后一个维度(D)开始往前推的。
+        # (0, 0) 代表 D 轴不 pad，前后填充 0；接着是 W 轴，接着是 H 轴
+        tensor = torch.nn.functional.pad(tensor, (0, 0, pad_w_before, pad_w_after, pad_h_before, pad_h_after), value=-1)
         tensor = tensor.permute(2, 0, 1).unsqueeze(0)
 
         return tensor.to(torch.bfloat16)
@@ -144,31 +148,29 @@ class CTLabelMatrixDataset(Dataset):
                 raise FileNotFoundError
         except Exception as e:
             print(f"⚠️ 警告: 读取 {folder_name} 失败 ({e})")
-            # 🚨 修正 4：异常托底 Tensor 必须同步为 320 深度！
             img_tensor = torch.zeros((1, 320, 480, 480), dtype=torch.bfloat16) 
             
         return img_tensor, labels, folder_name
 
 # ==========================================
-# 2. 核心评估管线 (全矩阵高通量优化版)
+# 2. 核心评估管线
 # ==========================================
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    results_folder = "./qwen_zeroshot_2000_v2/"
+    results_folder = "./qwen_zeroshot_2000_sample/"
     os.makedirs(results_folder, exist_ok=True)
 
+    # ⚠️ 强烈建议替换为你最新清洗(层厚过滤)后的测试集 CSV 路径！
     csv_file = "/home/huali/workspace/psj/evaluation_dataset/api/eval/labeled_eval_label_matrix.csv"
     data_dir = "/oss/share_data/CT/ct_dataset_eval_260514/ct_dataset_eval_260514_img/"
     qwen_path = "/home/huali/model/Qwen3.5-9B"
     meta_file = "/oss/share_data/CT/ct_dataset_eval_260514/train_metadata.csv"
 
-    # 🚨 修正 5：挂载我们的权重
-    pretrained_weights = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_11500_full_fixed.pt"
+    pretrained_weights = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_19500_full_fixed.pt"
 
     dataset = CTLabelMatrixDataset(csv_file=csv_file, data_dir=data_dir, meta_file=meta_file, limit=None)
     pathologies = dataset.pathologies
     
-    # 你可以安全地将 batch_size 调至 2 或 4 以加快推理速度
     dataloader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=4)
     print(f"📊 成功加载数据集，共 {len(dataset)} 例影像，包含 {len(pathologies)} 种疾病标签。")
 
@@ -189,7 +191,6 @@ def main():
 
     print(f"📥 正在加载预训练满血权重: {pretrained_weights}")
     state_dict = torch.load(pretrained_weights, map_location="cpu")
-    # 虽然是满血权重，保留 strict=False 依然是个好习惯
     clip.load_state_dict(state_dict, strict=False)
     clip.to(device)
 
@@ -244,7 +245,6 @@ def main():
     import gc
     gc.collect()             
     torch.cuda.empty_cache() 
-    print("✨ 显存清理完毕！可以安全进行大尺度 3D 视觉推理了！")
 
     print("\n🔄 正在将疾病特征缝合为高性能全并行矩阵...")
     text_latent_list = []
@@ -257,6 +257,7 @@ def main():
     print("🚀 开始 3D 视觉高通量推理...")
     all_predictions = []
     all_labels = []
+    all_patient_ids = []  # 🚨 修复Bug：初始化患者 ID 列表，防止下方代码崩溃
 
     temperature = clip.temperature.item() if hasattr(clip, 'temperature') else 0.07
 
@@ -273,18 +274,13 @@ def main():
             image_latent = F.normalize(image_latent, dim=-1)
 
             logits = (image_latent @ stacked_text_latents.T) / temperature
-
-            # 🚨 修正 6：消除原本 squeeze(0) 带来的 Batch 崩溃隐患
-            # 使其支持任意大小的 inference batch size
             logits = logits.view(batch_size, len(pathologies), 2)
             probs = F.softmax(logits, dim=-1)
 
-            # 提取正样本 (index 0) 概率，支持 Batch 级追加
             patient_preds = probs[:, :, 0].cpu().to(torch.float32).numpy()
             all_predictions.extend(patient_preds.tolist())
             all_labels.extend(labels.numpy().tolist())
 
-            # 保存患者 / 病例 ID，后面按“每个患者一行”计算样本级指标
             if isinstance(patient_id, (list, tuple)):
                 all_patient_ids.extend([str(x) for x in patient_id])
             else:
@@ -300,7 +296,6 @@ def main():
     all_labels = np.array(all_labels, dtype=np.int32)
     all_binary_preds = (all_predictions >= 0.5).astype(np.int32)
 
-    # 保存原始预测，方便后续重新调阈值或复查
     np.savez(
         os.path.join(results_folder, "predictions_and_labels.npz"),
         preds=all_predictions,
@@ -311,7 +306,7 @@ def main():
     )
 
     # ==========================================================
-    # A. 按疾病计算：原来的 macro，是“每一类疾病一个 F1，再平均”
+    # A. 按疾病计算：Macro
     # ==========================================================
     disease_results_list = []
     valid_disease_metrics = {'AUROC': [], 'F1': [], 'Accuracy': [], 'Precision': [], 'Recall': []}
@@ -353,8 +348,7 @@ def main():
     )
 
     # ==========================================================
-    # B. 按患者/样本计算：每个患者一行，跨所有疾病标签计算 F1
-    #    最终 Sample-Level F1 = 所有患者 F1 的平均值
+    # B. 按患者计算：Sample-Level
     # ==========================================================
     patient_results_list = []
     patient_f1_list = []
@@ -403,7 +397,6 @@ def main():
         index=False,
     )
 
-    # 汇总表：把你最关心的 sample-level F1 放在这里
     summary_metrics = {
         "Disease_Macro_AUROC": disease_avg_metrics["AUROC"],
         "Disease_Macro_F1": disease_avg_metrics["F1"],
@@ -442,9 +435,6 @@ def main():
     print(f"   🎯 Sample-Level Recall:     {format_metric(sample_avg_metrics['Sample_Recall'])}")
     print("="*60)
     print("✅ 评估全部完成！")
-    print(f"📄 疾病级指标: {os.path.join(results_folder, 'qwen_zeroshot_disease_macro_metrics.xlsx')}")
-    print(f"📄 样本级指标: {os.path.join(results_folder, 'qwen_zeroshot_sample_level_metrics.xlsx')}")
-    print(f"📄 汇总指标:   {os.path.join(results_folder, 'qwen_zeroshot_summary_metrics.xlsx')}")
 
 if __name__ == "__main__":
     main()
