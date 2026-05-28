@@ -629,10 +629,6 @@ class CTCLIP(nn.Module):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = '<|endoftext|>'
 
-        # 🚨 辅助任务：10 个部位的线性分类头
-        self.num_body_parts = 10
-        self.body_classifier = nn.Linear(self.dim_image, self.num_body_parts)
-
     def state_dict(self, *args, **kwargs):
         return super().state_dict(*args, **kwargs)
 
@@ -672,8 +668,7 @@ class CTCLIP(nn.Module):
             freeze_text_encoder = False,    # text encoder is not trained if this is set to True
             text_to_image = True,           # in the case the extra projection is turned on, would return different similarity values depending on modality directionality
             aug_text = None,                # augmented text (for multiview)
-            aug_image = None,               # augmented image (for multiview)
-            body_labels = None,  # 🚨 新增形参接收部位标签
+            aug_image = None                # augmented image (for multiview)
     ):
         b, device = text.input_ids.shape[0], device
 
@@ -958,6 +953,7 @@ class CTCLIP(nn.Module):
         local_image_latents_extra = image_latents_extra[0] if self.extra_latent_projection else local_image_latents
 
         # 1. 跨卡收集全局特征 
+        # 如果单卡 bs=2, 8卡环境, 收集后 global 特征的 shape 为 [16, dim]
         global_text_latents = all_gather_with_grad(local_text_latents)
         global_image_latents = all_gather_with_grad(local_image_latents)
         
@@ -965,15 +961,17 @@ class CTCLIP(nn.Module):
         global_image_latents_extra = all_gather_with_grad(local_image_latents_extra)
 
         # 2. 计算非对称相似度矩阵 Local @ Global.T 
+        # 结果 shape: [2, 16] -> 每张卡的 2 个样本去 16 个全局样本里找答案
         logits_per_image = temp * (local_image_latents_extra @ global_text_latents_extra.t())
         logits_per_text  = temp * (local_text_latents @ global_image_latents.t())
 
-        # 3. 动态生成标签偏移量
+        # 3. 动态生成标签偏移量 (核心精华)
         batch_size = local_image_latents.shape[0]
         rank = dist.get_rank() if dist.is_initialized() else 0
+        # Rank 0 找 0,1; Rank 1 找 2,3...
         labels = torch.arange(batch_size, device=device) + rank * batch_size
 
-        # 4. 使用 PyTorch 原生 CrossEntropy 计算 InfoNCE
+        # 4. 使用 PyTorch 原生、高效、数值稳定的 CrossEntropy 计算 InfoNCE
         image_to_text_loss = F.cross_entropy(logits_per_image, labels)
         text_to_image_loss = F.cross_entropy(logits_per_text, labels)
 
@@ -981,7 +979,11 @@ class CTCLIP(nn.Module):
         cl_loss = (image_to_text_loss + text_to_image_loss) / 2
         # ===================================================================
 
+        # if no augmented text or images passed in, multiview loss weight is 0
+
         multiview_loss_weight = self.multiview_loss_weight if is_multiview else 0
+
+        # calculate weights
 
         cl_loss_weight = 1 - (self.text_ssl_loss_weight + self.image_ssl_loss_weight + multiview_loss_weight)
 
@@ -989,28 +991,12 @@ class CTCLIP(nn.Module):
                + (text_ssl_loss * self.text_ssl_loss_weight) \
                + (image_ssl_loss * self.image_ssl_loss_weight)
 
-        if is_multiview:
-            raise NotImplementedError("Multiview Contrastive Loss is explicitly disabled in the cross-GPU FSDP architecture.")
+        # add multiview CL loss with weight
 
-        # ===================================================================
-        # 🚨 终极核武器：部位感知多标签辅助分类 (Auxiliary Classification Loss)
-        # ===================================================================
-        if body_labels is not None:
-            # 1. 物理安全屏障：使用本卡的潜变量特征(512维)进行分类，避免 FSDP 全局张量污染
-            # local_image_latents 的形状严格为 [batch_size, 512]
-            body_logits = self.body_classifier(local_image_latents)
-            
-            # 2. 计算多标签 BCE 损失
-            # ⚠️ 致命警告防御：BCEWithLogitsLoss 在 BFloat16 混合精度下极易数值溢出 (NaN)
-            # 必须强转回 Float32 进行 Loss 计算，保证梯度稳定回传！
-            cls_loss = F.binary_cross_entropy_with_logits(
-                body_logits.to(torch.float32), 
-                body_labels.to(torch.float32)
-            )
-            
-            # 3. 损失融合：0.5 是一个经过实战检验的绝佳系数
-            # 既能在一开始给模型强烈的部位定位信号，又不会反客为主破坏 InfoNCE 对比学习主轴
-            loss = loss + 0.5 * cls_loss
-        # ===================================================================
+        if is_multiview:
+            # loss = loss + multiview_cl_loss.mean() * multiview_loss_weight
+            # 由于我们已经重构了全局特征池，传统的多视角增强逻辑在此架构下会引发维度冲突
+            # 既然是纯预训练，强制阻断报错即可
+            raise NotImplementedError("Multiview Contrastive Loss is explicitly disabled in the cross-GPU FSDP architecture.")
 
         return loss
