@@ -157,16 +157,19 @@ class CTLabelMatrixDataset(Dataset):
 # ==========================================
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    results_folder = "./qwen_zeroshot_2000_sample/"
+    results_folder = "./qwen_zeroshot_chest_sample/"
     os.makedirs(results_folder, exist_ok=True)
 
     # ⚠️ 强烈建议替换为你最新清洗(层厚过滤)后的测试集 CSV 路径！
-    csv_file = "/home/huali/workspace/psj/evaluation_dataset/api/eval/labeled_eval_label_matrix.csv"
+    #csv_file = "/home/huali/workspace/psj/evaluation_dataset/api/eval/labeled_eval_label_matrix.csv"
+    #csv_file = "/home/huali/code/CT-CLIP-main/eval/labeled_eval_chest.csv"
+    csv_file = "/home/huali/code/CT-CLIP-main/eval/label_high_freq.csv"
     data_dir = "/oss/share_data/CT/ct_dataset_eval_260514/ct_dataset_eval_260514_img/"
     qwen_path = "/home/huali/model/Qwen3.5-9B"
     meta_file = "/oss/share_data/CT/ct_dataset_eval_260514/train_metadata.csv"
 
-    pretrained_weights = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_24500_full_fixed.pt"
+    #pretrained_weights = "/mnt/huali/ct_dataset_10000/output_v2_body/CTClip_step_11000_full_fixed.pt"
+    pretrained_weights = "/data4/huali/ct_dataset_10000/output_v2/CTClip_step_24500_full_fixed.pt"
 
     dataset = CTLabelMatrixDataset(csv_file=csv_file, data_dir=data_dir, meta_file=meta_file, limit=None)
     pathologies = dataset.pathologies
@@ -174,7 +177,7 @@ def main():
     dataloader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=4)
     print(f"📊 成功加载数据集，共 {len(dataset)} 例影像，包含 {len(pathologies)} 种疾病标签。")
 
-    print("🏗️ 正在构建 CT-CLIP-Qwen 模型架构...")
+    print(" 正在构建 CT-CLIP-Qwen 模型架构...")
     ctvit = CTViT(
         dim=512, codebook_size=8192, image_size=480, patch_size=20, temporal_patch_size=10,
         spatial_depth=4, temporal_depth=4, dim_head=32, heads=8
@@ -189,7 +192,7 @@ def main():
         downsample_image_embeds=False, use_all_token_embeds=False, tokenizer=None
     )
 
-    print(f"📥 正在加载预训练满血权重: {pretrained_weights}")
+    print(f"正在加载预训练权重: {pretrained_weights}")
     state_dict = torch.load(pretrained_weights, map_location="cpu")
     clip.load_state_dict(state_dict, strict=False)
     clip.to(device)
@@ -215,7 +218,7 @@ def main():
     if hasattr(clip.visual_transformer, 'vq'):
         clip.visual_transformer.vq.register_forward_pre_hook(vq_pre_hook)
 
-    print("🧠 正在使用 Qwen-9B 预计算中文提示词特征 (Text Feature Caching)...")
+    print("正在使用 Qwen-9B 预计算中文提示词特征 (Text Feature Caching)...")
     text_features_cache = {}
 
     with torch.no_grad():
@@ -238,7 +241,7 @@ def main():
             text_latent = F.normalize(text_latent, dim=-1) 
             text_features_cache[pathology] = text_latent
 
-    print("\n🧹 文本缓存完毕！正在销毁 Qwen 模型并强制清理显存...")
+    print("\n🧹文本缓存完毕！正在销毁 Qwen 模型并强制清理显存...")
     if 'text_model' in locals(): del text_model
     if hasattr(clip, 'text_encoder'): del clip.text_encoder
     if hasattr(clip, 'text_transformer'): del clip.text_transformer
@@ -246,7 +249,7 @@ def main():
     gc.collect()             
     torch.cuda.empty_cache() 
 
-    print("\n🔄 正在将疾病特征缝合为高性能全并行矩阵...")
+    print("\n正在将疾病特征缝合为高性能全并行矩阵...")
     text_latent_list = []
     for pathology in pathologies:
         text_latent_list.append(text_features_cache[pathology])
@@ -254,7 +257,7 @@ def main():
     stacked_text_latents = torch.cat(text_latent_list, dim=0).to(device)
     stacked_text_latents = F.normalize(stacked_text_latents, dim=-1)
 
-    print("🚀 开始 3D 视觉高通量推理...")
+    print("开始 3D 视觉高通量推理...")
     all_predictions = []
     all_labels = []
     all_patient_ids = []  # 🚨 修复Bug：初始化患者 ID 列表，防止下方代码崩溃
@@ -286,7 +289,7 @@ def main():
             else:
                 all_patient_ids.append(str(patient_id))
 
-    print("📈 正在计算各项评估指标：按疾病 Macro + 按患者 Sample-Level... ")
+    print("正在计算各项评估指标：按疾病 Macro + 按患者 Sample-Level... ")
 
     if len(all_predictions) == 0:
         print("❌ 推理未产生任何结果，结束评估。")
@@ -421,18 +424,18 @@ def main():
     print("="*60)
     def format_metric(val): return f"{val:.4f}" if isinstance(val, (float, np.floating)) else "N/A"
 
-    print("📌 按疾病 Macro-Avg：每类疾病先算一次，再对疾病取平均")
-    print(f"   🎯 Disease Macro AUROC:     {format_metric(disease_avg_metrics['AUROC'])}")
-    print(f"   🎯 Disease Macro F1-Score:  {format_metric(disease_avg_metrics['F1'])}")
-    print(f"   🎯 Disease Macro Accuracy:  {format_metric(disease_avg_metrics['Accuracy'])}")
-    print(f"   🎯 Disease Macro Precision: {format_metric(disease_avg_metrics['Precision'])}")
-    print(f"   🎯 Disease Macro Recall:    {format_metric(disease_avg_metrics['Recall'])}")
+    print(" 按疾病 Macro-Avg：每类疾病先算一次，再对疾病取平均")
+    print(f"    Disease Macro AUROC:     {format_metric(disease_avg_metrics['AUROC'])}")
+    print(f"    Disease Macro F1-Score:  {format_metric(disease_avg_metrics['F1'])}")
+    print(f"    Disease Macro Accuracy:  {format_metric(disease_avg_metrics['Accuracy'])}")
+    print(f"    Disease Macro Precision: {format_metric(disease_avg_metrics['Precision'])}")
+    print(f"    Disease Macro Recall:    {format_metric(disease_avg_metrics['Recall'])}")
 
-    print("\n📌 按患者 Sample-Level Avg：每个患者跨所有疾病标签算 F1，再对患者取平均")
-    print(f"   🎯 Sample-Level F1-Score:   {format_metric(sample_avg_metrics['Sample_F1'])}")
-    print(f"   🎯 Sample-Level Accuracy:   {format_metric(sample_avg_metrics['Sample_Accuracy'])}")
-    print(f"   🎯 Sample-Level Precision:  {format_metric(sample_avg_metrics['Sample_Precision'])}")
-    print(f"   🎯 Sample-Level Recall:     {format_metric(sample_avg_metrics['Sample_Recall'])}")
+    print("\n 按患者 Sample-Level Avg：每个患者跨所有疾病标签算 F1，再对患者取平均")
+    print(f"    Sample-Level F1-Score:   {format_metric(sample_avg_metrics['Sample_F1'])}")
+    print(f"    Sample-Level Accuracy:   {format_metric(sample_avg_metrics['Sample_Accuracy'])}")
+    print(f"    Sample-Level Precision:  {format_metric(sample_avg_metrics['Sample_Precision'])}")
+    print(f"    Sample-Level Recall:     {format_metric(sample_avg_metrics['Sample_Recall'])}")
     print("="*60)
     print("✅ 评估全部完成！")
 

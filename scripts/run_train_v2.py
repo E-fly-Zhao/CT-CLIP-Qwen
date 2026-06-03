@@ -169,8 +169,8 @@ trainer = CTClipTrainer(
     # 接入清洗后的全身数据
     data_train = f"{base_csv_dir}/filtered_thin_slices_train.csv", 
     data_valid = f"{base_csv_dir}/filtered_thin_slices_valid.csv",
-    reports_file_train = f"{base_csv_dir}/filtered_train_reports.csv", 
-    reports_file_valid = f"{base_csv_dir}/filtered_valid_reports.csv",
+    reports_file_train = f"{base_csv_dir}/filtered_train_reports_with_body.csv", 
+    reports_file_valid = f"{base_csv_dir}/filtered_valid_reports_with_body.csv",
     train_meta_file = f"{base_csv_dir}/filtered_train_metadata.csv",
     valid_meta_file = f"{base_csv_dir}/filtered_valid_metadata.csv",
     

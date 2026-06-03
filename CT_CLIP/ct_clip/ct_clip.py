@@ -631,7 +631,7 @@ class CTCLIP(nn.Module):
 
         # 🚨 辅助任务：10 个部位的线性分类头
         self.num_body_parts = 10
-        self.body_classifier = nn.Linear(self.dim_image, self.num_body_parts)
+        self.body_classifier = nn.Linear(self.dim_latent, self.num_body_parts)
 
     def state_dict(self, *args, **kwargs):
         return super().state_dict(*args, **kwargs)

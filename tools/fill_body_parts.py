@@ -133,8 +133,10 @@ def process_row(row):
 # 3. 主程序：加载、处理、保存
 # =========================
 def main():
-    input_file = "/data1/sft/ct_workspace/ct_dataset_base_260428.xlsx"
-    output_file = "/home/huali/code/CT-CLIP-main/full_reports_body.xlsx"
+    #input_file = "/data1/sft/ct_workspace/ct_dataset_base_260428.xlsx"
+    input_file = "/home/huali/workspace/xly/CTModel/labeled_eval.xlsx"
+    #output_file = "/home/huali/code/CT-CLIP-main/full_reports_body.xlsx"
+    output_file = "/home/huali/workspace/xly/CTModel/labeled_eval_body.xlsx"
 
     print(f"📥 正在加载源数据: {input_file}")
     try:

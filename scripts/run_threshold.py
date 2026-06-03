@@ -167,7 +167,7 @@ def main():
     # meta_file = "/oss/share_data/CT/ct_dataset_eval_260514/train_metadata.csv"
     meta_file = "/home/huali/code/CT-CLIP-main/CT-CLIP/dataset_eval_2000/metadata_2005.csv"
 
-    pretrained_weights = "/mnt/huali/ct_dataset_10000/output_v2/CTClip_step_19500_full_fixed.pt"
+    pretrained_weights = "/mnt/huali/ct_dataset_10000/output_v2_body/CTClip_step_11000_full_fixed.pt"
 
     dataset = CTLabelMatrixDataset(csv_file=csv_file, data_dir=data_dir, meta_file=meta_file, limit=None)
     pathologies = dataset.pathologies
